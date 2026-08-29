@@ -1,3 +1,16 @@
+lean-alpaca-ai/
+├── api/
+│   ├── __init__.py
+│   └── main.py
+├── trading/
+│   ├── __init__.py
+│   ├── alpaca_client.py
+│   └── risk_manager.py
+├── requirements.txt
+├── Dockerfile
+├── .dockerignore
+├── .gitignore
+└── README.md
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
