@@ -1,20 +1,27 @@
 lean-alpaca-ai/
 │
-├── api/
-│   ├── __init__.py
-│   └── main.py
-│
-├── trading/
-│   ├── __init__.py
-│   ├── alpaca_client.py
-│   └── risk_manager.py
-│
-├── requirements.txt
-├── Dockerfile
-├── railway.json
-├── .gitignore
-└── .env.example
+from fastapi import FastAPI
 
+app = FastAPI(
+    title="LEAN Alpaca AI API",
+    description="API للتحكم في نظام التداول التجريبي",
+    version="1.0.0",
+)
+
+
+@app.get("/")
+def root():
+    return {
+        "status": "online",
+        "message": "LEAN Alpaca AI API is running"
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy"
+    }
 import os
 from typing import Optional
 
