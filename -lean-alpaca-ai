@@ -1,0 +1,832 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+COPY api ./api
+COPY trading ./trading
+
+EXPOSE 8000
+
+CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+requests==2.32.4
+pydantic==2.11.7
+# API package
+# Trading package
+import os
+import requests
+from typing import Optional, Dict, Any
+
+
+class AlpacaClient:
+    def __init__(self):
+        self.api_key = os.getenv("ALPACA_API_KEY", "").strip()
+        self.secret_key = os.getenv("ALPACA_SECRET_KEY", "").strip()
+
+        self.paper = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+
+        if self.paper:
+            self.base_url = "https://paper-api.alpaca.markets"
+        else:
+            self.base_url = "https://api.alpaca.markets"
+
+        self.headers = {
+            "APCA-API-KEY-ID": self.api_key,
+            "APCA-API-SECRET-KEY": self.secret_key,
+            "Content-Type": "application/json",
+        }
+
+    def _check_credentials(self):
+        if not self.api_key or not self.secret_key:
+            raise RuntimeError(
+                "ALPACA_API_KEY and ALPACA_SECRET_KEY are not configured."
+            )
+
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        data: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ):
+        self._check_credentials()
+
+        url = f"{self.base_url}{endpoint}"
+
+        response = requests.request(
+            method=method,
+            url=url,
+            headers=self.headers,
+            json=data,
+            params=params,
+            timeout=30,
+        )
+
+        if not response.ok:
+            try:
+                error = response.json()
+            except Exception:
+                error = response.text
+
+            raise RuntimeError(
+                f"Alpaca API error {response.status_code}: {error}"
+            )
+
+        if not response.text:
+            return {}
+
+        return response.json()
+
+    def get_account(self):
+        return self._request("GET", "/v2/account")
+
+    def get_positions(self):
+        return self._request("GET", "/v2/positions")
+
+    def get_position(self, symbol: str):
+        return self._request(
+            "GET",
+            f"/v2/positions/{symbol.upper()}"
+        )
+
+    def get_orders(
+        self,
+        status: str = "open",
+        limit: int = 50,
+    ):
+        return self._request(
+            "GET",
+            "/v2/orders",
+            params={
+                "status": status,
+                "limit": limit,
+                "nested": "true",
+            },
+        )
+
+    def get_order(self, order_id: str):
+        return self._request(
+            "GET",
+            f"/v2/orders/{order_id}"
+        )
+
+    def submit_order(
+        self,
+        symbol: str,
+        qty: Optional[float] = None,
+        notional: Optional[float] = None,
+        side: str = "buy",
+        order_type: str = "market",
+        time_in_force: str = "day",
+        limit_price: Optional[float] = None,
+        stop_price: Optional[float] = None,
+    ):
+        payload = {
+            "symbol": symbol.upper(),
+            "side": side.lower(),
+            "type": order_type.lower(),
+            "time_in_force": time_in_force.lower(),
+        }
+
+        if qty is not None:
+            payload["qty"] = str(qty)
+
+        if notional is not None:
+            payload["notional"] = str(notional)
+
+        if limit_price is not None:
+            payload["limit_price"] = str(limit_price)
+
+        if stop_price is not None:
+            payload["stop_price"] = str(stop_price)
+
+        return self._request(
+            "POST",
+            "/v2/orders",
+            data=payload
+        )
+
+    def cancel_order(self, order_id: str):
+        return self._request(
+            "DELETE",
+            f"/v2/orders/{order_id}"
+        )
+
+    def cancel_all_orders(self):
+        return self._request(
+            "DELETE",
+            "/v2/orders"
+        )
+
+    def close_position(
+        self,
+        symbol: str,
+        qty: Optional[float] = None,
+    ):
+        params = {}
+
+        if qty is not None:
+            params["qty"] = str(qty)
+
+        return self._request(
+            "DELETE",
+            f"/v2/positions/{symbol.upper()}",
+            params=params
+        )
+
+    def close_all_positions(self):
+        return self._request(
+            "DELETE",
+            "/v2/positions"
+        )
+
+    def get_clock(self):
+        return self._request(
+            "GET",
+            "/v2/clock"
+        )
+
+    def get_calendar(self, start=None, end=None):
+        params = {}
+
+        if start:
+            params["start"] = start
+
+        if end:
+            params["end"] = end
+
+        return self._request(
+            "GET",
+            "/v2/calendar",
+            params=params
+        )
+import os
+from typing import Dict, Any
+
+
+class RiskManager:
+    """
+    Basic risk controls.
+
+    All values are controlled through Railway environment variables.
+    """
+
+    def __init__(self):
+        self.max_order_usd = float(
+            os.getenv("MAX_ORDER_USD", "100")
+        )
+
+        self.max_position_usd = float(
+            os.getenv("MAX_POSITION_USD", "500")
+        )
+
+        self.max_positions = int(
+            os.getenv("MAX_POSITIONS", "10")
+        )
+
+        self.trading_enabled = (
+            os.getenv("ENABLE_TRADING", "false").lower()
+            == "true"
+        )
+
+    def validate_order(
+        self,
+        account: Dict[str, Any],
+        positions: list,
+        symbol: str,
+        side: str,
+        notional: float | None,
+        qty: float | None,
+        estimated_price: float | None = None,
+    ):
+        if not self.trading_enabled:
+            return False, "Trading is disabled."
+
+        side = side.lower()
+
+        if side not in ("buy", "sell"):
+            return False, "Side must be buy or sell."
+
+        if notional is None and qty is None:
+            return False, "Either qty or notional is required."
+
+        if notional is not None:
+            order_value = float(notional)
+        elif qty is not None and estimated_price is not None:
+            order_value = float(qty) * float(estimated_price)
+        else:
+            order_value = 0
+
+        if order_value > self.max_order_usd:
+            return (
+                False,
+                f"Order exceeds MAX_ORDER_USD={self.max_order_usd}"
+            )
+
+        if len(positions) >= self.max_positions:
+            existing = any(
+                str(p.get("symbol", "")).upper()
+                == symbol.upper()
+                for p in positions
+            )
+
+            if not existing and side == "buy":
+                return (
+                    False,
+                    f"Maximum positions reached: {self.max_positions}"
+                )
+
+        equity = float(
+            account.get("equity", 0) or 0
+        )
+
+        if equity <= 0:
+            return False, "Account equity is zero or unavailable."
+
+        if order_value > self.max_position_usd:
+            return (
+                False,
+                f"Order exceeds MAX_POSITION_USD={self.max_position_usd}"
+            )
+
+        return True, "Risk checks passed."
+
+    def summary(self):
+        return {
+            "trading_enabled": self.trading_enabled,
+            "max_order_usd": self.max_order_usd,
+            "max_position_usd": self.max_position_usd,
+            "max_positions": self.max_positions,
+        }
+import os
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from trading.alpaca_client import AlpacaClient
+from trading.risk_manager import RiskManager
+
+
+app = FastAPI(
+    title="LEAN Alpaca AI Trading API",
+    description="API bridge between AI/LEAN systems and Alpaca.",
+    version="1.0.0",
+)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+alpaca = AlpacaClient()
+risk = RiskManager()
+
+
+APP_API_KEY = os.getenv("APP_API_KEY", "").strip()
+
+
+def authenticate(
+    x_api_key: Optional[str] = Header(default=None)
+):
+    """
+    Protect trading endpoints.
+
+    If APP_API_KEY is empty, authentication is disabled.
+    For production, set APP_API_KEY in Railway.
+    """
+
+    if not APP_API_KEY:
+        return True
+
+    if x_api_key != APP_API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key."
+        )
+
+    return True
+
+
+class OrderRequest(BaseModel):
+    symbol: str = Field(
+        ...,
+        min_length=1,
+        max_length=10
+    )
+
+    side: str = Field(
+        ...,
+        pattern="^(buy|sell)$"
+    )
+
+    qty: Optional[float] = Field(
+        default=None,
+        gt=0
+    )
+
+    notional: Optional[float] = Field(
+        default=None,
+        gt=0
+    )
+
+    order_type: str = Field(
+        default="market"
+    )
+
+    time_in_force: str = Field(
+        default="day"
+    )
+
+    limit_price: Optional[float] = Field(
+        default=None,
+        gt=0
+    )
+
+    stop_price: Optional[float] = Field(
+        default=None,
+        gt=0
+    )
+
+
+@app.get("/")
+def root():
+    return {
+        "name": "LEAN Alpaca AI Trading API",
+        "status": "online",
+        "paper_trading": alpaca.paper,
+        "trading_enabled": risk.trading_enabled,
+        "version": "1.0.0",
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "service": "lean-alpaca-ai",
+        "paper_trading": alpaca.paper,
+    }
+
+
+@app.get("/api/status")
+def status():
+    return {
+        "api": "online",
+        "alpaca_configured": bool(
+            alpaca.api_key and alpaca.secret_key
+        ),
+        "paper_trading": alpaca.paper,
+        "risk": risk.summary(),
+    }
+
+
+@app.get("/api/account")
+def account(
+    _: bool = Header(
+        default=True,
+        alias="X-API-Key"
+    )
+):
+    try:
+        return alpaca.get_account()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.get("/api/positions")
+def positions():
+    try:
+        return alpaca.get_positions()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.get("/api/positions/{symbol}")
+def position(symbol: str):
+    try:
+        return alpaca.get_position(symbol)
+    except Exception as e:
+        raise HTTPException(
+            status_code=404,
+            detail=str(e)
+        )
+
+
+@app.get("/api/orders")
+def orders(
+    status: str = "open",
+    limit: int = 50,
+):
+    try:
+        return alpaca.get_orders(
+            status=status,
+            limit=limit
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.get("/api/orders/{order_id}")
+def get_order(order_id: str):
+    try:
+        return alpaca.get_order(order_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=404,
+            detail=str(e)
+        )
+
+
+@app.post("/api/order")
+def create_order(
+    order: OrderRequest,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    authenticate(x_api_key)
+
+    symbol = order.symbol.upper()
+
+    if order.qty is None and order.notional is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide qty or notional."
+        )
+
+    if order.order_type.lower() == "market":
+        if order.limit_price is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="limit_price is only valid for limit orders."
+            )
+
+    try:
+        account_data = alpaca.get_account()
+        current_positions = alpaca.get_positions()
+
+        allowed, message = risk.validate_order(
+            account=account_data,
+            positions=current_positions,
+            symbol=symbol,
+            side=order.side,
+            notional=order.notional,
+            qty=order.qty,
+            estimated_price=order.limit_price,
+        )
+
+        if not allowed:
+            raise HTTPException(
+                status_code=403,
+                detail=message
+            )
+
+        result = alpaca.submit_order(
+            symbol=symbol,
+            qty=order.qty,
+            notional=order.notional,
+            side=order.side,
+            order_type=order.order_type,
+            time_in_force=order.time_in_force,
+            limit_price=order.limit_price,
+            stop_price=order.stop_price,
+        )
+
+        return {
+            "success": True,
+            "message": "Order submitted.",
+            "order": result,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.delete("/api/orders/{order_id}")
+def cancel_order(
+    order_id: str,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    authenticate(x_api_key)
+
+    try:
+        result = alpaca.cancel_order(order_id)
+
+        return {
+            "success": True,
+            "message": "Order cancellation requested.",
+            "result": result,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.delete("/api/orders")
+def cancel_all_orders(
+    x_api_key: Optional[str] = Header(default=None),
+):
+    authenticate(x_api_key)
+
+    try:
+        result = alpaca.cancel_all_orders()
+
+        return {
+            "success": True,
+            "message": "All open orders cancellation requested.",
+            "result": result,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.delete("/api/positions/{symbol}")
+def close_position(
+    symbol: str,
+    qty: Optional[float] = None,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    authenticate(x_api_key)
+
+    if not risk.trading_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="Trading is disabled."
+        )
+
+    try:
+        result = alpaca.close_position(
+            symbol=symbol,
+            qty=qty
+        )
+
+        return {
+            "success": True,
+            "message": f"Close request submitted for {symbol.upper()}.",
+            "result": result,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.delete("/api/positions")
+def close_all_positions(
+    x_api_key: Optional[str] = Header(default=None),
+):
+    authenticate(x_api_key)
+
+    if not risk.trading_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="Trading is disabled."
+        )
+
+    try:
+        result = alpaca.close_all_positions()
+
+        return {
+            "success": True,
+            "message": "Close-all request submitted.",
+            "result": result,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.get("/api/clock")
+def clock():
+    try:
+        return alpaca.get_clock()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.get("/api/calendar")
+def calendar(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    try:
+        return alpaca.get_calendar(
+            start=start,
+            end=end
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.get("/api/risk")
+def risk_settings():
+    return risk.summary()
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv
+env
+.vscode
+.idea
+README.md
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+env/
+
+.env
+.env.*
+
+.vscode/
+.idea/
+
+.DS_Store
+
+*.log
+# LEAN Alpaca AI Trading API
+
+API bridge for connecting AI/LEAN systems with Alpaca.
+
+## Default mode
+
+The application uses Alpaca Paper Trading by default.
+
+ALPACA_PAPER=true
+
+## Railway Variables
+
+Set these variables in Railway:
+
+ALPACA_API_KEY=YOUR_ALPACA_PAPER_KEY
+ALPACA_SECRET_KEY=YOUR_ALPACA_PAPER_SECRET
+
+ALPACA_PAPER=true
+
+APP_API_KEY=CREATE_A_LONG_RANDOM_API_KEY
+
+ENABLE_TRADING=false
+
+MAX_ORDER_USD=100
+MAX_POSITION_USD=500
+MAX_POSITIONS=10
+
+## Start
+
+The Dockerfile starts:
+
+uvicorn api.main:app --host 0.0.0.0 --port $PORT
+
+## API
+
+GET /
+
+GET /health
+
+GET /api/status
+
+GET /api/account
+
+GET /api/positions
+
+GET /api/orders
+
+POST /api/order
+
+DELETE /api/orders/{order_id}
+
+DELETE /api/orders
+
+DELETE /api/positions/{symbol}
+
+DELETE /api/positions
+
+GET /api/clock
+
+GET /api/calendar
+
+## Example order
+
+POST /api/order
+
+Headers:
+
+X-API-Key: YOUR_APP_API_KEY
+
+JSON:
+
+{
+    "symbol": "AAPL",
+    "side": "buy",
+    "notional": 50,
+    "order_type": "market",
+    "time_in_force": "day"
+}
+
+Trading must be enabled:
+
+ENABLE_TRADING=true
+
+Otherwise orders are rejected.
+
+## Security
+
+Never put Alpaca keys directly inside Python source code.
+
+Never commit .env files.
+
+Use Railway Variables.
