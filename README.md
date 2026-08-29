@@ -1,22 +1,10 @@
--lean-alpaca-ai
-│
-├── api
-│   ├── __init__.py
-│   └── main.py
-│
-├── trading
-│   ├── __init__.py
-│   ├── alpaca_client.py
-│   └── risk_manager.py
-│
-├── Dockerfile
-├── requirements.txt
-├── .dockerignore
-└── .gitignore
-CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
-import os
-import requests
-
+Dockerfile
+requirements.txt
+api/
+trading/
+.gitignore
+.dockerignore
+README.md
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
