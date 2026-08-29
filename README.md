@@ -1,17 +1,18 @@
-fastapi==0.116.1
-uvicorn[standard]==0.35.0
-requests==2.32.5
-pydantic==2.11.7
-
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-COPY requirements.txt .
-
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
+-lean-alpaca-ai
+│
+├── api
+│   ├── __init__.py
+│   └── main.py
+│
+├── trading
+│   ├── __init__.py
+│   ├── alpaca_client.py
+│   └── risk_manager.py
+│
+├── Dockerfile
+├── requirements.txt
+├── .dockerignore
+└── .gitignore
 CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
 import os
 import requests
