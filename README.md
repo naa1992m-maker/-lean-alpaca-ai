@@ -1,21 +1,7 @@
--lean-alpaca-ai/
-├── api/
-│   ├── __init__.py
-│   └── main.py
-│
-├── trading/
-│   ├── __init__.py
-│   ├── alpaca_client.py
-│   └── risk_manager.py
-│
-├── requirements.txt
-├── Dockerfile
-├── .dockerignore
-├── .gitignore
-└── README.md
-FROM python:3.12-slim
-
-WORKDIR /app
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+requests==2.32.5
+pydantic==2.11.7
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
