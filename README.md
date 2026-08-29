@@ -1,24 +1,206 @@
-Dockerfile
-requirements.txt
-api/
-trading/
-.gitignore
-.dockerignore
-README.md
-from fastapi import FastAPI, HTTPException
+lean-alpaca-ai/
+│
+├── api/
+│   ├── __init__.py
+│   └── main.py
+│
+├── trading/
+│   ├── __init__.py
+│   ├── alpaca_client.py
+│   └── risk_manager.py
+│
+├── requirements.txt
+├── Dockerfile
+├── railway.json
+├── .gitignore
+└── .env.example
+
+import os
+from typing import Optional
+
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
+
+from trading.alpaca_client import AlpacaTradingClient
+from trading.risk_manager import RiskManager
 
 
 app = FastAPI(
-    title="LEAN Alpaca AI",
-    description="API للتحكم في Alpaca Paper Trading",
-    version="1.0.0",
+    title="AI Trading API",
+    description="FastAPI bridge between ChatGPT, Railway and Alpaca Paper Trading",
+    version="1.0.0"
 )
 
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
+API_TOKEN = os.getenv("API_TOKEN", "")
 
+alpaca = AlpacaTradingClient()
+risk_manager = RiskManager()
+
+
+class OrderRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=10)
+    side: str
+    qty: float = Field(gt=0)
+
+
+def check_token(authorization: Optional[str]):
+    """
+    Protect the API using:
+    Authorization: Bearer YOUR_API_TOKEN
+    """
+
+    if not API_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="API_TOKEN is not configured on Railway."
+        )
+
+    expected = f"Bearer {API_TOKEN}"
+
+    if authorization != expected:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+
+@app.get("/")
+def root():
+    return {
+        "status": "online",
+        "service": "AI Trading API",
+        "mode": "paper"
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy"
+    }
+
+
+@app.get("/account")
+def account(
+    authorization: Optional[str] = Header(default=None)
+):
+    check_token(authorization)
+
+    try:
+        return alpaca.get_account()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.get("/positions")
+def positions(
+    authorization: Optional[str] = Header(default=None)
+):
+    check_token(authorization)
+
+    try:
+        return alpaca.get_positions()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.get("/orders")
+def orders(
+    authorization: Optional[str] = Header(default=None)
+):
+    check_token(authorization)
+
+    try:
+        return alpaca.get_orders()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.post("/order")
+def create_order(
+    order: OrderRequest,
+    authorization: Optional[str] = Header(default=None)
+):
+    check_token(authorization)
+
+    symbol = order.symbol.upper()
+    side = order.side.lower()
+    qty = order.qty
+
+    if side not in ["buy", "sell"]:
+        raise HTTPException(
+            status_code=400,
+            detail="side must be 'buy' or 'sell'"
+        )
+
+    # Risk management
+    risk_check = risk_manager.check_order(
+        symbol=symbol,
+        side=side,
+        qty=qty
+    )
+
+    if not risk_check["approved"]:
+        raise HTTPException(
+            status_code=400,
+            detail=risk_check["reason"]
+        )
+
+    try:
+        result = alpaca.submit_market_order(
+            symbol=symbol,
+            side=side,
+            qty=qty
+        )
+
+        return {
+            "success": True,
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "order": result
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.delete("/positions/{symbol}")
+def close_position(
+    symbol: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    check_token(authorization)
+
+    symbol = symbol.upper()
+
+    try:
+        result = alpaca.close_position(symbol)
+
+        return {
+            "success": True,
+            "symbol": symbol,
+            "result": result
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 ALPACA_BASE_URL = os.getenv(
     "ALPACA_BASE_URL",
     "https://paper-api.alpaca.markets"
